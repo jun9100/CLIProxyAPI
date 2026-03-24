@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/apiuser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -50,11 +51,54 @@ const idempotencyKeyMetadataKey = "idempotency_key"
 const (
 	defaultStreamingKeepAliveSeconds = 0
 	defaultStreamingBootstrapRetries = 0
+	apiUserAllowedModelsContextKey   = "api_user_allowed_models"
 )
 
 type pinnedAuthContextKey struct{}
 type selectedAuthCallbackContextKey struct{}
 type executionSessionContextKey struct{}
+
+// SetAPIUserAllowedModels stores a normalized allowlist on the current Gin request context.
+func SetAPIUserAllowedModels(c *gin.Context, models []string) {
+	if c == nil || len(models) == 0 {
+		return
+	}
+	allowed := make(map[string]struct{}, len(models))
+	for _, model := range models {
+		if trimmed := strings.TrimSpace(model); trimmed != "" {
+			allowed[trimmed] = struct{}{}
+		}
+	}
+	if len(allowed) == 0 {
+		return
+	}
+	c.Set(apiUserAllowedModelsContextKey, allowed)
+}
+
+// FilterModelsForContext applies any api-user-management allowlist stored on Gin context.
+func FilterModelsForContext(c *gin.Context, models []map[string]any) []map[string]any {
+	if c == nil || len(models) == 0 {
+		return models
+	}
+
+	raw, exists := c.Get(apiUserAllowedModelsContextKey)
+	if !exists {
+		return models
+	}
+	allowed, ok := raw.(map[string]struct{})
+	if !ok || len(allowed) == 0 {
+		return models
+	}
+
+	filtered := make([]map[string]any, 0, len(models))
+	for _, model := range models {
+		id, _ := model["id"].(string)
+		if _, ok := allowed[strings.TrimSpace(id)]; ok {
+			filtered = append(filtered, model)
+		}
+	}
+	return filtered
+}
 
 // WithPinnedAuthID returns a child context that requests execution on a specific auth ID.
 func WithPinnedAuthID(ctx context.Context, authID string) context.Context {
@@ -261,6 +305,15 @@ type BaseAPIHandler struct {
 
 	// Cfg holds the current application configuration.
 	Cfg *config.SDKConfig
+
+	// APIUserPolicy holds managed client-key runtime policy for HTTP and websocket requests.
+	APIUserPolicy *apiuser.Manager
+
+	// APIUserQuotaRecovery tracks quota-blocked -> recovered transitions per client key.
+	APIUserQuotaRecovery *apiuser.QuotaRecoveryTracker
+
+	// APIUserRuntimeCleanup clears per-client runtime state after recovery.
+	APIUserRuntimeCleanup *apiuser.RuntimeCleanupRegistry
 }
 
 // NewBaseAPIHandlers creates a new API handlers instance.
@@ -286,6 +339,20 @@ func NewBaseAPIHandlers(cfg *config.SDKConfig, authManager *coreauth.Manager) *B
 //   - clients: The new slice of AI service clients
 //   - cfg: The new application configuration
 func (h *BaseAPIHandler) UpdateClients(cfg *config.SDKConfig) { h.Cfg = cfg }
+
+// ObserveAPIUserQuotaRecovery triggers scoped cleanup once when a client key
+// becomes allowed again after a local quota block.
+func (h *BaseAPIHandler) ObserveAPIUserQuotaRecovery(apiKey string, decision apiuser.Decision) {
+	if h == nil || h.APIUserQuotaRecovery == nil {
+		return
+	}
+	if !h.APIUserQuotaRecovery.Observe(apiKey, decision) {
+		return
+	}
+	if h.APIUserRuntimeCleanup != nil {
+		h.APIUserRuntimeCleanup.CleanupAPIKey(apiKey)
+	}
+}
 
 // GetAlt extracts the 'alt' parameter from the request query string.
 // It checks both 'alt' and '$alt' parameters and returns the appropriate value.

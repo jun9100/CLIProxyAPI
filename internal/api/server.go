@@ -5,10 +5,12 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -24,6 +26,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/apiuser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -37,6 +40,7 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"gopkg.in/yaml.v3"
 )
 
@@ -131,6 +135,15 @@ type Server struct {
 
 	// cfg holds the current server configuration.
 	cfg *config.Config
+
+	// apiUserPolicy evaluates managed client-key runtime policy for /v1 traffic.
+	apiUserPolicy *apiuser.Manager
+
+	// apiUserQuotaRecovery tracks quota-blocked -> recovered transitions across config reloads.
+	apiUserQuotaRecovery *apiuser.QuotaRecoveryTracker
+
+	// apiUserRuntimeCleanup clears per-client runtime state after recovery.
+	apiUserRuntimeCleanup *apiuser.RuntimeCleanupRegistry
 
 	// oldConfigYaml stores a YAML snapshot of the previous configuration for change detection.
 	// This prevents issues when the config object is modified in place by Management API.
@@ -241,9 +254,16 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 
 	// Create server instance
 	s := &Server{
-		engine:              engine,
-		handlers:            handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
-		cfg:                 cfg,
+		engine:               engine,
+		handlers:             handlers.NewBaseAPIHandlers(&cfg.SDKConfig, authManager),
+		cfg:                  cfg,
+		apiUserPolicy:        apiuser.NewManager(cfg.APIUserManagement),
+		apiUserQuotaRecovery: apiuser.NewQuotaRecoveryTracker(),
+		apiUserRuntimeCleanup: apiuser.NewRuntimeCleanupRegistry(func(sessionID string) {
+			if authManager != nil {
+				authManager.CloseExecutionSession(sessionID)
+			}
+		}, openai.ClearResponsesAuthAffinityOwner),
 		accessManager:       accessManager,
 		requestLogger:       requestLogger,
 		loggerToggle:        toggle,
@@ -256,6 +276,11 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	// Save initial YAML snapshot
 	s.oldConfigYaml, _ = yaml.Marshal(cfg)
 	s.applyAccessConfig(nil, cfg)
+	if s.handlers != nil {
+		s.handlers.APIUserPolicy = s.apiUserPolicy
+		s.handlers.APIUserQuotaRecovery = s.apiUserQuotaRecovery
+		s.handlers.APIUserRuntimeCleanup = s.apiUserRuntimeCleanup
+	}
 	if authManager != nil {
 		authManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second, cfg.MaxRetryCredentials)
 	}
@@ -327,6 +352,7 @@ func (s *Server) setupRoutes() {
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
 	v1.Use(AuthMiddleware(s.accessManager))
+	v1.Use(s.apiUserRuntimePolicyMiddleware())
 	{
 		v1.GET("/models", s.unifiedModelsHandler(openaiHandlers, claudeCodeHandlers))
 		v1.POST("/chat/completions", openaiHandlers.ChatCompletions)
@@ -640,6 +666,97 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/iflow-auth-url", s.mgmt.RequestIFlowCookieToken)
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
+	}
+}
+
+func (s *Server) apiUserRuntimePolicyMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.apiUserPolicy == nil || !s.apiUserPolicy.ManagedOnly() {
+			c.Next()
+			return
+		}
+
+		model, err := readRequestModel(c)
+		if err != nil {
+			c.Next()
+			return
+		}
+
+		apiKey := apiKeyFromGinContext(c)
+		decision := s.apiUserPolicy.CheckRuntime(apiuser.Request{
+			APIKey: apiKey,
+			Model:  model,
+			Path:   c.Request.URL.Path,
+			Method: c.Request.Method,
+		}, usage.GetRequestStatistics().Snapshot(), time.Now().UTC())
+		s.observeAPIUserQuotaRecovery(apiKey, decision)
+		if decision.Blocked {
+			c.AbortWithStatusJSON(decision.StatusCode, apiUserDecisionPayload(decision))
+			return
+		}
+
+		handlers.SetAPIUserAllowedModels(c, s.apiUserPolicy.AllowedModels(apiKey))
+		c.Next()
+	}
+}
+
+func apiKeyFromGinContext(c *gin.Context) string {
+	if c == nil {
+		return ""
+	}
+	if value, exists := c.Get("apiKey"); exists {
+		switch typed := value.(type) {
+		case string:
+			return strings.TrimSpace(typed)
+		default:
+			return strings.TrimSpace(fmt.Sprintf("%v", typed))
+		}
+	}
+	return ""
+}
+
+func readRequestModel(c *gin.Context) (string, error) {
+	if c == nil || c.Request == nil || c.Request.Body == nil {
+		return "", nil
+	}
+	switch c.Request.Method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return "", nil
+	}
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		return "", err
+	}
+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) == 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(gjson.GetBytes(body, "model").String()), nil
+}
+
+func apiUserDecisionPayload(decision apiuser.Decision) gin.H {
+	payload := gin.H{
+		"error":   decision.Code,
+		"message": decision.Message,
+	}
+	if decision.Code == apiuser.ErrorCodeQuotaExceeded {
+		payload["limit_key"] = decision.LimitKey
+		payload["metric"] = decision.Metric
+		payload["used"] = decision.Used
+		payload["limit"] = decision.Limit
+	}
+	return payload
+}
+
+func (s *Server) observeAPIUserQuotaRecovery(apiKey string, decision apiuser.Decision) {
+	if s == nil || s.apiUserQuotaRecovery == nil {
+		return
+	}
+	if !s.apiUserQuotaRecovery.Observe(apiKey, decision) {
+		return
+	}
+	if s.apiUserRuntimeCleanup != nil {
+		s.apiUserRuntimeCleanup.CleanupAPIKey(apiKey)
 	}
 }
 
@@ -957,6 +1074,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 
 	s.applyAccessConfig(oldCfg, cfg)
 	s.cfg = cfg
+	s.apiUserPolicy = apiuser.NewManager(cfg.APIUserManagement)
+	if s.handlers != nil {
+		s.handlers.APIUserPolicy = s.apiUserPolicy
+		s.handlers.APIUserQuotaRecovery = s.apiUserQuotaRecovery
+		s.handlers.APIUserRuntimeCleanup = s.apiUserRuntimeCleanup
+	}
 	s.wsAuthEnabled.Store(cfg.WebsocketAuth)
 	if oldCfg != nil && s.wsAuthChanged != nil && oldCfg.WebsocketAuth != cfg.WebsocketAuth {
 		s.wsAuthChanged(oldCfg.WebsocketAuth, cfg.WebsocketAuth)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -13,9 +14,11 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/apiuser"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -55,6 +58,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return
 	}
 	passthroughSessionID := uuid.NewString()
+	releaseTrackedSession := h.trackAPIUserWebsocketSession(c, passthroughSessionID)
 	clientRemoteAddr := ""
 	if c != nil && c.Request != nil {
 		clientRemoteAddr = strings.TrimSpace(c.Request.RemoteAddr)
@@ -72,6 +76,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			h.AuthManager.CloseExecutionSession(passthroughSessionID)
 			log.Infof("responses websocket: upstream execution session closed id=%s", passthroughSessionID)
 		}
+		releaseTrackedSession()
 		setWebsocketRequestBody(c, wsBodyLog.String())
 		if errClose := conn.Close(); errClose != nil {
 			log.Warnf("responses websocket: close connection error: %v", errClose)
@@ -81,6 +86,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	var lastRequest []byte
 	lastResponseOutput := []byte("[]")
 	pinnedAuthID := ""
+	forceDisableIncrementalAfterAuthReset := false
 
 	for {
 		msgType, payload, errReadMessage := conn.ReadMessage()
@@ -107,16 +113,18 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		appendWebsocketEvent(&wsBodyLog, "request", payload)
 
 		allowIncrementalInputWithPreviousResponseID := false
-		if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
-			if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
-				allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+		if !forceDisableIncrementalAfterAuthReset {
+			if pinnedAuthID != "" && h != nil && h.AuthManager != nil {
+				if pinnedAuth, ok := h.AuthManager.GetByID(pinnedAuthID); ok && pinnedAuth != nil {
+					allowIncrementalInputWithPreviousResponseID = websocketUpstreamSupportsIncrementalInput(pinnedAuth.Attributes, pinnedAuth.Metadata)
+				}
+			} else {
+				requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
+				if requestModelName == "" {
+					requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
+				}
+				allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 			}
-		} else {
-			requestModelName := strings.TrimSpace(gjson.GetBytes(payload, "model").String())
-			if requestModelName == "" {
-				requestModelName = strings.TrimSpace(gjson.GetBytes(lastRequest, "model").String())
-			}
-			allowIncrementalInputWithPreviousResponseID = h.websocketUpstreamSupportsIncrementalInputForModel(requestModelName)
 		}
 
 		var requestJSON []byte
@@ -151,6 +159,36 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
+		if errMsg = h.apiUserPolicyError(c, requestJSON); errMsg != nil {
+			h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+			markAPIResponseTimestamp(c)
+			errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
+			appendWebsocketEvent(&wsBodyLog, "response", errorPayload)
+			if errWrite != nil {
+				return
+			}
+			continue
+		}
+		nextSessionRequestSnapshot := updatedLastRequest
+		if shouldBuildResponsesWebsocketFullSnapshot(requestJSON, allowIncrementalInputWithPreviousResponseID) {
+			_, shadowLastRequest, shadowErr := normalizeResponsesWebsocketRequestWithMode(
+				payload,
+				lastRequest,
+				lastResponseOutput,
+				false,
+			)
+			if shadowErr != nil {
+				nextSessionRequestSnapshot = lastRequest
+				log.Warnf(
+					"responses websocket: keep previous snapshot id=%s status=%d error=%v",
+					passthroughSessionID,
+					shadowErr.StatusCode,
+					shadowErr.Error,
+				)
+			} else {
+				nextSessionRequestSnapshot = shadowLastRequest
+			}
+		}
 		if shouldHandleResponsesWebsocketPrewarmLocally(payload, lastRequest, allowIncrementalInputWithPreviousResponseID) {
 			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
 				requestJSON = updated
@@ -167,29 +205,140 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			}
 			continue
 		}
-		lastRequest = updatedLastRequest
 
 		modelName := gjson.GetBytes(requestJSON, "model").String()
+		apiKey := apiKeyFromOpenAIContext(c)
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
 		cliCtx = handlers.WithExecutionSessionID(cliCtx, passthroughSessionID)
+		selectedAuthID := strings.TrimSpace(pinnedAuthID)
+		if pinnedAuthID == "" {
+			if stickyAuthID := responsesHTTPAuthAffinity.lookupRequest(requestJSON); stickyAuthID != "" {
+				pinnedAuthID = stickyAuthID
+				selectedAuthID = stickyAuthID
+			}
+		}
 		if pinnedAuthID != "" {
 			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
 		} else {
 			cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
-				pinnedAuthID = strings.TrimSpace(authID)
+				authID = strings.TrimSpace(authID)
+				if authID == "" || h == nil || h.AuthManager == nil {
+					return
+				}
+				selectedAuthID = authID
+				selectedAuth, ok := h.AuthManager.GetByID(authID)
+				if !ok || selectedAuth == nil {
+					return
+				}
+				if websocketUpstreamSupportsIncrementalInput(selectedAuth.Attributes, selectedAuth.Metadata) {
+					pinnedAuthID = authID
+				}
 			})
 		}
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
+		dataChan = observeResponsesAuthAffinity(apiKey, dataChan, func() string { return selectedAuthID })
 
-		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsBodyLog, passthroughSessionID)
+		completedOutput, terminalStatus, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsBodyLog, passthroughSessionID)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errForward.Error()))
 			log.Warnf("responses websocket: forward failed id=%s error=%v", passthroughSessionID, errForward)
 			return
 		}
-		lastResponseOutput = completedOutput
+		if shouldResetResponsesWebsocketAuthPin(terminalStatus) {
+			pinnedAuthID = ""
+			forceDisableIncrementalAfterAuthReset = true
+			if h != nil && h.AuthManager != nil {
+				h.AuthManager.CloseExecutionSession(passthroughSessionID)
+			}
+		} else if forceDisableIncrementalAfterAuthReset && terminalStatus == 0 {
+			forceDisableIncrementalAfterAuthReset = false
+		}
+		if terminalStatus == 0 {
+			lastRequest = nextSessionRequestSnapshot
+			lastResponseOutput = completedOutput
+		}
+	}
+}
+
+func (h *OpenAIResponsesAPIHandler) apiUserPolicyError(c *gin.Context, requestJSON []byte) *interfaces.ErrorMessage {
+	if h == nil || h.BaseAPIHandler == nil || h.APIUserPolicy == nil || !h.APIUserPolicy.ManagedOnly() {
+		return nil
+	}
+
+	apiKey := ""
+	if c != nil {
+		if value, exists := c.Get("apiKey"); exists {
+			switch typed := value.(type) {
+			case string:
+				apiKey = strings.TrimSpace(typed)
+			default:
+				apiKey = strings.TrimSpace(fmt.Sprintf("%v", typed))
+			}
+		}
+	}
+
+	decision := h.APIUserPolicy.CheckRuntime(apiuser.Request{
+		APIKey: apiKey,
+		Model:  strings.TrimSpace(gjson.GetBytes(requestJSON, "model").String()),
+		Path:   "/v1/responses",
+		Method: http.MethodPost,
+	}, usage.GetRequestStatistics().Snapshot(), time.Now().UTC())
+	h.ObserveAPIUserQuotaRecovery(apiKey, decision)
+	if !decision.Blocked {
+		return nil
+	}
+
+	payload, errMarshal := json.Marshal(handlers.ErrorResponse{
+		Error: handlers.ErrorDetail{
+			Message: decision.Message,
+			Type:    websocketPolicyErrorType(decision.StatusCode),
+			Code:    decision.Code,
+		},
+	})
+	if errMarshal != nil {
+		return &interfaces.ErrorMessage{
+			StatusCode: decision.StatusCode,
+			Error:      errors.New(decision.Message),
+		}
+	}
+
+	return &interfaces.ErrorMessage{
+		StatusCode: decision.StatusCode,
+		Error:      errors.New(string(payload)),
+	}
+}
+
+func (h *OpenAIResponsesAPIHandler) trackAPIUserWebsocketSession(c *gin.Context, sessionID string) func() {
+	if h == nil || h.BaseAPIHandler == nil || h.APIUserRuntimeCleanup == nil {
+		return func() {}
+	}
+	apiKey := apiKeyFromOpenAIContext(c)
+	if apiKey == "" {
+		return func() {}
+	}
+	h.APIUserRuntimeCleanup.TrackSession(apiKey, sessionID)
+	return func() {
+		h.APIUserRuntimeCleanup.UntrackSession(sessionID)
+	}
+}
+
+func websocketPolicyErrorType(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return "authentication_error"
+	case http.StatusForbidden:
+		return "permission_error"
+	case http.StatusTooManyRequests:
+		return "rate_limit_error"
+	case http.StatusBadRequest:
+		return "invalid_request_error"
+	default:
+		if status >= http.StatusInternalServerError {
+			return "server_error"
+		}
+		return "invalid_request_error"
 	}
 }
 
@@ -478,6 +627,14 @@ func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, lastRequest []
 	return generateResult.Exists() && !generateResult.Bool()
 }
 
+func shouldBuildResponsesWebsocketFullSnapshot(normalizedRequestJSON []byte, allowIncrementalInputWithPreviousResponseID bool) bool {
+	if !allowIncrementalInputWithPreviousResponseID {
+		return false
+	}
+	prev := strings.TrimSpace(gjson.GetBytes(normalizedRequestJSON, "previous_response_id").String())
+	return prev != ""
+}
+
 func writeResponsesWebsocketSyntheticPrewarm(
 	c *gin.Context,
 	conn *websocket.Conn,
@@ -600,21 +757,23 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 	errs <-chan *interfaces.ErrorMessage,
 	wsBodyLog *strings.Builder,
 	sessionID string,
-) ([]byte, error) {
+) ([]byte, int, error) {
 	completed := false
 	completedOutput := []byte("[]")
+	terminalStatusCode := 0
 
 	for {
 		select {
 		case <-c.Request.Context().Done():
 			cancel(c.Request.Context().Err())
-			return completedOutput, c.Request.Context().Err()
+			return completedOutput, terminalStatusCode, c.Request.Context().Err()
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
 				continue
 			}
 			if errMsg != nil {
+				terminalStatusCode = errMsg.StatusCode
 				h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 				markAPIResponseTimestamp(c)
 				errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
@@ -634,7 +793,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					// 	errWrite,
 					// )
 					cancel(errMsg.Error)
-					return completedOutput, errWrite
+					return completedOutput, terminalStatusCode, errWrite
 				}
 			}
 			if errMsg != nil {
@@ -642,7 +801,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			} else {
 				cancel(nil)
 			}
-			return completedOutput, nil
+			return completedOutput, terminalStatusCode, nil
 		case chunk, ok := <-data:
 			if !ok {
 				if !completed {
@@ -650,6 +809,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						StatusCode: http.StatusRequestTimeout,
 						Error:      fmt.Errorf("stream closed before response.completed"),
 					}
+					terminalStatusCode = errMsg.StatusCode
 					h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
 					markAPIResponseTimestamp(c)
 					errorPayload, errWrite := writeResponsesWebsocketError(conn, errMsg)
@@ -669,13 +829,13 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 							errWrite,
 						)
 						cancel(errMsg.Error)
-						return completedOutput, errWrite
+						return completedOutput, terminalStatusCode, errWrite
 					}
 					cancel(errMsg.Error)
-					return completedOutput, nil
+					return completedOutput, terminalStatusCode, nil
 				}
 				cancel(nil)
-				return completedOutput, nil
+				return completedOutput, terminalStatusCode, nil
 			}
 
 			payloads := websocketJSONPayloadsFromChunk(chunk)
@@ -702,10 +862,19 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 						errWrite,
 					)
 					cancel(errWrite)
-					return completedOutput, errWrite
+					return completedOutput, terminalStatusCode, errWrite
 				}
 			}
 		}
+	}
+}
+
+func shouldResetResponsesWebsocketAuthPin(statusCode int) bool {
+	switch statusCode {
+	case http.StatusTooManyRequests, http.StatusForbidden, http.StatusPaymentRequired:
+		return true
+	default:
+		return false
 	}
 }
 
