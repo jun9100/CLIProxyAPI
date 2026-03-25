@@ -177,7 +177,6 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	body = applyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
 	body, _ = sjson.SetBytes(body, "model", baseModel)
 	body, _ = sjson.SetBytes(body, "stream", true)
-	body, _ = sjson.DeleteBytes(body, "previous_response_id")
 	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
 	body, _ = sjson.DeleteBytes(body, "safety_identifier")
 	if !gjson.GetBytes(body, "instructions").Exists() {
@@ -233,8 +232,8 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
-		if respHS != nil && respHS.StatusCode > 0 {
-			return resp, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+		if classified, _ := classifyCodexWebsocketBootstrapFailure(respHS, bodyErr, errDial); classified != nil {
+			return resp, classified
 		}
 		recordAPIResponseError(ctx, e.cfg, errDial)
 		return resp, errDial
@@ -429,8 +428,8 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
-		if respHS != nil && respHS.StatusCode > 0 {
-			return nil, statusErr{code: respHS.StatusCode, msg: string(bodyErr)}
+		if classified, _ := classifyCodexWebsocketBootstrapFailure(respHS, bodyErr, errDial); classified != nil {
+			return nil, classified
 		}
 		recordAPIResponseError(ctx, e.cfg, errDial)
 		if sess != nil {
@@ -950,10 +949,7 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	}
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
-	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
-		headers:   headers,
-	}, true
+	return newCodexWebsocketStatusErr(status, out, headers), true
 }
 
 func parseCodexWebsocketErrorHeaders(payload []byte) http.Header {

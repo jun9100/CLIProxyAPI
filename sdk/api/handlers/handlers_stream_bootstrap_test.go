@@ -2,10 +2,14 @@ package handlers
 
 import (
 	"context"
+	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	coreexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -15,6 +19,12 @@ import (
 type failOnceStreamExecutor struct {
 	mu    sync.Mutex
 	calls int
+}
+
+type orderedStreamSelector struct {
+	mu     sync.Mutex
+	order  []string
+	cursor int
 }
 
 func (e *failOnceStreamExecutor) Identifier() string { return "codex" }
@@ -74,6 +84,30 @@ func (e *failOnceStreamExecutor) Calls() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.calls
+}
+
+func (s *orderedStreamSelector) Pick(_ context.Context, _ string, _ string, _ coreexecutor.Options, auths []*coreauth.Auth) (*coreauth.Auth, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if len(auths) == 0 {
+		return nil, errors.New("no auth available")
+	}
+	for len(s.order) > 0 && s.cursor < len(s.order) {
+		authID := strings.TrimSpace(s.order[s.cursor])
+		s.cursor++
+		for _, auth := range auths {
+			if auth != nil && auth.ID == authID {
+				return auth, nil
+			}
+		}
+	}
+	for _, auth := range auths {
+		if auth != nil {
+			return auth, nil
+		}
+	}
+	return nil, errors.New("no auth available")
 }
 
 type payloadThenErrorStreamExecutor struct {
@@ -235,6 +269,37 @@ func (e *authAwareStreamExecutor) AuthIDs() []string {
 	return out
 }
 
+func collectStreamResult(t *testing.T, dataChan <-chan []byte, errChan <-chan *interfaces.ErrorMessage) ([]byte, []*interfaces.ErrorMessage) {
+	t.Helper()
+
+	timeout := time.NewTimer(2 * time.Second)
+	defer timeout.Stop()
+
+	var data []byte
+	var errs []*interfaces.ErrorMessage
+
+	for dataChan != nil || errChan != nil {
+		select {
+		case <-timeout.C:
+			t.Fatal("timed out waiting for stream result")
+		case chunk, ok := <-dataChan:
+			if !ok {
+				dataChan = nil
+				continue
+			}
+			data = append(data, chunk...)
+		case msg, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			errs = append(errs, msg)
+		}
+	}
+
+	return data, errs
+}
+
 func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	executor := &failOnceStreamExecutor{}
 	manager := coreauth.NewManager(nil, nil, nil)
@@ -298,6 +363,63 @@ func TestExecuteStreamWithAuthManager_RetriesBeforeFirstByte(t *testing.T) {
 	upstreamAttemptHeader := upstreamHeaders.Get("X-Upstream-Attempt")
 	if upstreamAttemptHeader != "2" {
 		t.Fatalf("expected upstream header from retry attempt, got %q", upstreamAttemptHeader)
+	}
+}
+
+func TestExecuteStreamWithAuthManager_RetriesCodexWebsocketBootstrapBeforeFirstByte(t *testing.T) {
+	executor := &authAwareStreamExecutor{}
+	manager := coreauth.NewManager(nil, &orderedStreamSelector{order: []string{"auth1", "auth2"}}, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:       "auth1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	auth2 := &coreauth.Auth{
+		ID:       "auth2",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 1,
+		},
+	}, manager)
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(context.Background(), "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	got, errMsgs := collectStreamResult(t, dataChan, errChan)
+	for _, msg := range errMsgs {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	if string(got) != "ok" {
+		t.Fatalf("expected payload ok, got %q", string(got))
+	}
+	if gotAuthIDs := executor.AuthIDs(); len(gotAuthIDs) != 2 || gotAuthIDs[0] != "auth1" || gotAuthIDs[1] != "auth2" {
+		t.Fatalf("auth IDs = %v, want [auth1 auth2]", gotAuthIDs)
 	}
 }
 
@@ -553,6 +675,72 @@ func TestExecuteStreamWithAuthManager_SelectedAuthCallbackReceivesAuthID(t *test
 	}
 	if selectedAuthID != "auth2" {
 		t.Fatalf("selectedAuthID = %q, want %q", selectedAuthID, "auth2")
+	}
+}
+
+func TestExecuteStreamWithAuthManager_SelectedAuthCallbackTracksRetriedAuth(t *testing.T) {
+	executor := &authAwareStreamExecutor{}
+	manager := coreauth.NewManager(nil, &orderedStreamSelector{order: []string{"auth1", "auth2"}}, nil)
+	manager.RegisterExecutor(executor)
+
+	auth1 := &coreauth.Auth{
+		ID:       "auth1",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test1@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth1); err != nil {
+		t.Fatalf("manager.Register(auth1): %v", err)
+	}
+
+	auth2 := &coreauth.Auth{
+		ID:       "auth2",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Metadata: map[string]any{"email": "test2@example.com"},
+	}
+	if _, err := manager.Register(context.Background(), auth2); err != nil {
+		t.Fatalf("manager.Register(auth2): %v", err)
+	}
+
+	registry.GetGlobalRegistry().RegisterClient(auth1.ID, auth1.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	registry.GetGlobalRegistry().RegisterClient(auth2.ID, auth2.Provider, []*registry.ModelInfo{{ID: "test-model"}})
+	t.Cleanup(func() {
+		registry.GetGlobalRegistry().UnregisterClient(auth1.ID)
+		registry.GetGlobalRegistry().UnregisterClient(auth2.ID)
+	})
+
+	handler := NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{
+			BootstrapRetries: 1,
+		},
+	}, manager)
+
+	selectedAuthID := ""
+	var selectedAuthMu sync.Mutex
+	ctx := WithSelectedAuthIDCallback(context.Background(), func(authID string) {
+		selectedAuthMu.Lock()
+		selectedAuthID = authID
+		selectedAuthMu.Unlock()
+	})
+	dataChan, _, errChan := handler.ExecuteStreamWithAuthManager(ctx, "openai", "test-model", []byte(`{"model":"test-model"}`), "")
+	if dataChan == nil || errChan == nil {
+		t.Fatalf("expected non-nil channels")
+	}
+
+	_, errMsgs := collectStreamResult(t, dataChan, errChan)
+	for _, msg := range errMsgs {
+		if msg != nil {
+			t.Fatalf("unexpected error: %+v", msg)
+		}
+	}
+
+	selectedAuthMu.Lock()
+	gotSelectedAuthID := selectedAuthID
+	selectedAuthMu.Unlock()
+
+	if gotSelectedAuthID != "auth2" {
+		t.Fatalf("selectedAuthID = %q, want %q", gotSelectedAuthID, "auth2")
 	}
 }
 

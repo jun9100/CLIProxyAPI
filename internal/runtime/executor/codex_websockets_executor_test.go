@@ -7,9 +7,12 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
+	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	"github.com/tidwall/gjson"
 )
 
@@ -29,6 +32,50 @@ func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T)
 	}
 	if got := gjson.GetBytes(wsReqBody, "type").String(); got == "response.append" {
 		t.Fatalf("unexpected websocket request type: %s", got)
+	}
+}
+
+func TestCodexWebsocketsExecutorExecutePreservesPreviousResponseID(t *testing.T) {
+	var gotBody []byte
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Fatalf("Upgrade() error = %v", err)
+		}
+		defer conn.Close()
+
+		_, payload, err := conn.ReadMessage()
+		if err != nil {
+			t.Fatalf("ReadMessage() error = %v", err)
+		}
+		gotBody = append([]byte(nil), payload...)
+
+		completed := `{"type":"response.completed","response":{"id":"resp_2","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}`
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(completed)); err != nil {
+			t.Fatalf("WriteMessage() error = %v", err)
+		}
+	}))
+	defer server.Close()
+
+	executor := NewCodexWebsocketsExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{Attributes: map[string]string{
+		"base_url": server.URL,
+		"api_key":  "test",
+	}}
+	payload := []byte(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"再补充一个生活中的例子"}]}]}`)
+	_, err := executor.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "gpt-5.4",
+		Payload: payload,
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FromString("openai-response"),
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got := gjson.GetBytes(gotBody, "previous_response_id").String(); got != "resp-1" {
+		t.Fatalf("previous_response_id = %q, want %q", got, "resp-1")
 	}
 }
 
@@ -199,5 +246,14 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 
 	if dialer.Proxy != nil {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
+	}
+}
+
+func TestCodexWebsocketBootstrapFailureInvalidatesOnlyRetryableStatusErrors(t *testing.T) {
+	if !shouldInvalidateCodexSessionBeforeFirstByte(statusErr{code: http.StatusUnauthorized, msg: "unauthorized"}) {
+		t.Fatal("expected bootstrap unauthorized error to invalidate websocket session before first payload")
+	}
+	if shouldInvalidateCodexSessionBeforeFirstByte(context.DeadlineExceeded) {
+		t.Fatal("expected generic read errors to stay terminal instead of being reclassified as bootstrap failures")
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	. "github.com/router-for-me/CLIProxyAPI/v6/internal/constant"
@@ -136,6 +137,84 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 	cliCancel()
 }
 
+func responsesOutputAvailable(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("[]"))
+}
+
+func isResponsesUnsupportedPreviousResponseIDError(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil {
+		return false
+	}
+	message := strings.TrimSpace(errMsg.Error.Error())
+	if message == "" {
+		return false
+	}
+	detail := strings.TrimSpace(gjson.Get(message, "detail").String())
+	if detail == "" {
+		detail = strings.TrimSpace(gjson.Get(message, "error.message").String())
+	}
+	if detail == "" {
+		detail = message
+	}
+	return strings.Contains(strings.ToLower(detail), "unsupported parameter: previous_response_id")
+}
+
+func normalizeResponsesRequestForHistory(rawJSON []byte) []byte {
+	normalized, _, errMsg := normalizeResponseCreateRequest(rawJSON)
+	if errMsg == nil && len(normalized) > 0 {
+		return normalized
+	}
+	return bytes.Clone(rawJSON)
+}
+
+func shouldRetryResponsesContinuation(rawJSON []byte, errMsg *interfaces.ErrorMessage, previousRequest []byte, previousResponseOutput []byte) bool {
+	return strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) != "" &&
+		isResponsesUnsupportedPreviousResponseIDError(errMsg) &&
+		len(previousRequest) > 0 &&
+		responsesOutputAvailable(previousResponseOutput)
+}
+
+func buildResponsesFallbackRequest(rawJSON []byte, previousRequest []byte, previousResponseOutput []byte, stream bool) ([]byte, []byte, *interfaces.ErrorMessage) {
+	retryPayload, retryHistory, errMsg := normalizeResponseSubsequentRequest(rawJSON, previousRequest, previousResponseOutput, false)
+	if errMsg != nil {
+		return nil, nil, errMsg
+	}
+	if stream {
+		return retryPayload, retryHistory, nil
+	}
+	if updated, errDelete := sjson.DeleteBytes(retryPayload, "stream"); errDelete == nil {
+		retryPayload = updated
+	}
+	return retryPayload, retryHistory, nil
+}
+
+func shouldPremergeResponsesContinuationForOpenAICompatibility(rawJSON []byte, affinityState responsesAuthAffinityState, h *OpenAIResponsesAPIHandler) bool {
+	if strings.TrimSpace(gjson.GetBytes(rawJSON, "previous_response_id").String()) == "" {
+		return false
+	}
+	if strings.TrimSpace(affinityState.authID) == "" {
+		return false
+	}
+	if len(affinityState.requestPayload) == 0 || !responsesOutputAvailable(affinityState.responseOutput) {
+		return false
+	}
+	if h == nil || h.AuthManager == nil {
+		return false
+	}
+	auth, ok := h.AuthManager.GetByID(strings.TrimSpace(affinityState.authID))
+	if !ok || auth == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility") {
+		return true
+	}
+	if auth.Attributes == nil {
+		return false
+	}
+	return strings.TrimSpace(auth.Attributes["compat_name"]) != ""
+}
+
 // handleNonStreamingResponse handles non-streaming chat completion responses
 // for Gemini models. It selects a client from the pool, sends the request, and
 // aggregates the response before sending it back to the client in OpenAIResponses format.
@@ -146,17 +225,51 @@ func (h *OpenAIResponsesAPIHandler) Compact(c *gin.Context) {
 func (h *OpenAIResponsesAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
 	c.Header("Content-Type", "application/json")
 
-	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+	affinityState := responsesHTTPAuthAffinity.lookupRequestState(rawJSON)
+	selectedAuthID := ""
+	if pinnedAuthID := affinityState.authID; pinnedAuthID != "" {
+		cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+		selectedAuthID = pinnedAuthID
+	}
+	cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+		selectedAuthID = strings.TrimSpace(authID)
+	})
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+	requestPayload := rawJSON
+	requestForBind := normalizeResponsesRequestForHistory(requestPayload)
+	if shouldPremergeResponsesContinuationForOpenAICompatibility(rawJSON, affinityState, h) {
+		retryPayload, retryHistory, retryErr := buildResponsesFallbackRequest(rawJSON, affinityState.requestPayload, affinityState.responseOutput, false)
+		if retryErr == nil {
+			requestPayload = retryPayload
+			requestForBind = retryHistory
+		}
+	}
+	modelName := gjson.GetBytes(requestPayload, "model").String()
 
-	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	resp, upstreamHeaders, errMsg := h.ExecuteWithAuthManager(cliCtx, h.HandlerType(), modelName, requestPayload, "")
+	if shouldRetryResponsesContinuation(requestPayload, errMsg, affinityState.requestPayload, affinityState.responseOutput) {
+		retryPayload, retryHistory, retryErr := buildResponsesFallbackRequest(requestPayload, affinityState.requestPayload, affinityState.responseOutput, false)
+		if retryErr == nil {
+			resp, upstreamHeaders, errMsg = h.ExecuteWithAuthManager(
+				cliCtx,
+				h.HandlerType(),
+				gjson.GetBytes(retryPayload, "model").String(),
+				retryPayload,
+				"",
+			)
+			if errMsg == nil {
+				requestForBind = retryHistory
+			}
+		}
+	}
 	stopKeepAlive()
 	if errMsg != nil {
 		h.WriteErrorResponse(c, errMsg)
 		cliCancel(errMsg.Error)
 		return
 	}
+	responsesHTTPAuthAffinity.bindPayload(selectedAuthID, requestForBind, resp)
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
 	_, _ = c.Writer.Write(resp)
 	cliCancel()
@@ -183,9 +296,38 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 	}
 
 	// New core execution path
-	modelName := gjson.GetBytes(rawJSON, "model").String()
-	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+	affinityState := responsesHTTPAuthAffinity.lookupRequestState(rawJSON)
+	selectedAuthID := ""
+	requestPayload := rawJSON
+	requestForBind := normalizeResponsesRequestForHistory(requestPayload)
+	if shouldPremergeResponsesContinuationForOpenAICompatibility(rawJSON, affinityState, h) {
+		retryPayload, retryHistory, retryErr := buildResponsesFallbackRequest(rawJSON, affinityState.requestPayload, affinityState.responseOutput, true)
+		if retryErr == nil {
+			requestPayload = retryPayload
+			requestForBind = retryHistory
+		}
+	}
+	var cliCancel handlers.APIHandlerCancelFunc
+	startStream := func(requestPayload []byte) (<-chan []byte, http.Header, <-chan *interfaces.ErrorMessage) {
+		modelName := gjson.GetBytes(requestPayload, "model").String()
+		cliCtx, nextCancel := h.GetContextWithCancel(h, c, context.Background())
+		cliCancel = nextCancel
+		if pinnedAuthID := affinityState.authID; pinnedAuthID != "" {
+			cliCtx = handlers.WithPinnedAuthID(cliCtx, pinnedAuthID)
+			selectedAuthID = pinnedAuthID
+		}
+		cliCtx = handlers.WithSelectedAuthIDCallback(cliCtx, func(authID string) {
+			selectedAuthID = strings.TrimSpace(authID)
+		})
+		dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestPayload, "")
+		dataChan = observeResponsesAuthAffinity(
+			dataChan,
+			func() string { return selectedAuthID },
+			func() []byte { return requestForBind },
+		)
+		return dataChan, upstreamHeaders, errChan
+	}
+	dataChan, upstreamHeaders, errChan := startStream(requestPayload)
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -205,6 +347,17 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 				// Err channel closed cleanly; wait for data channel.
 				errChan = nil
 				continue
+			}
+			if shouldRetryResponsesContinuation(requestPayload, errMsg, affinityState.requestPayload, affinityState.responseOutput) {
+				retryPayload, retryHistory, retryErr := buildResponsesFallbackRequest(requestPayload, affinityState.requestPayload, affinityState.responseOutput, true)
+				if retryErr == nil {
+					requestForBind = retryHistory
+					if cliCancel != nil {
+						cliCancel(errMsg.Error)
+					}
+					dataChan, upstreamHeaders, errChan = startStream(retryPayload)
+					continue
+				}
 			}
 			// Upstream failed immediately. Return proper error status and JSON.
 			h.WriteErrorResponse(c, errMsg)
